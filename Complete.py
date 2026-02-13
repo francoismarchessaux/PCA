@@ -1,32 +1,16 @@
 """
-Unified PCA Hedging Model Builder
-================================
+FULL PROJECT PIPELINE — Corrected version (includes RollingPCAModel)
 
-You asked: "only one main PCA model builder function, where I can choose all options".
-
-This file keeps all the underlying building blocks, but exposes ONE top-level function:
-
-    build_pca_hedge_model(...)
-
-It can:
-- Load/clean market data (optional; you can also pass X_changes directly)
-- Fit rolling PCA
-- Run Step 3 Family A (implied PCA anchors) and/or Family B (sparse proxy instruments)
-- Run Step 4 backtest (optional; if you provide sensitivities)
-
-The output is a single dict containing:
-- X_levels, X_changes, meta
-- pca_results (rolling PCA fit results)
-- familyA_mappings
-- familyB_fits
-- backtest results + summary stats (if sensitivities provided)
-
-This design makes it easy to run daily: one function call, with options.
+This is a single-file implementation for Steps 1→4:
+  Step 1: load/clean market data, convert units, compute changes
+  Step 2: Rolling PCA (RollingPCAModel) with cov/corr + sample/LedoitWolf
+  Step 3A: Family A (Implied PCA): fixed or auto anchors + stickiness
+  Step 3B: Family B (Sparse proxy instruments): stability selection + ridge refit
+  Step 4: Backtest / PnL tracking: full PnL vs hedge PnL (A and B)
 
 Dependencies:
-- numpy, pandas
-- scikit-learn (LedoitWolf, ElasticNet, Ridge, StandardScaler)
-
+  numpy, pandas
+  scikit-learn: LedoitWolf, ElasticNet, Ridge, StandardScaler
 """
 
 from __future__ import annotations
@@ -44,7 +28,7 @@ from sklearn.preprocessing import StandardScaler
 
 
 # =============================================================================
-# Step 1 utilities (tenor parsing, cleaning, units)
+# STEP 1 — Data plumbing
 # =============================================================================
 
 _TENOR_RE = re.compile(r"^\s*(?P<num>\d+(\.\d+)?)\s*(?P<unit>[DdWwMmYy])\s*$")
@@ -54,7 +38,7 @@ def tenor_to_years(label: str) -> float:
     s = str(label).strip()
     m = _TENOR_RE.match(s)
     if not m:
-        raise ValueError(f"Unrecognized tenor format: {label!r}. Expected like '3M', '2Y', '1W'.")
+        raise ValueError(f"Unrecognized tenor format: {label!r} (expected '3M', '2Y', '1W', ...)")
     num = float(m.group("num"))
     unit = m.group("unit").upper()
     if unit == "D":
@@ -95,8 +79,15 @@ def sort_tenors(labels: Iterable[str]) -> List[str]:
 
 @dataclass(frozen=True)
 class RateUnits:
-    input_unit: str = "pct"   # "pct" | "dec" | "bp"
-    target_unit: str = "bp"   # "bp" | "pct" | "dec"
+    """
+    input_unit:
+      - "pct": 2.35 means 2.35%
+      - "dec": 0.0235 means 2.35%
+      - "bp" : 235 means 2.35%
+    target_unit: recommended "bp"
+    """
+    input_unit: str = "pct"
+    target_unit: str = "bp"
 
     def __post_init__(self):
         iu = self.input_unit.lower()
@@ -145,6 +136,8 @@ def _read_table(
         raise ValueError(f"Unsupported file type for {path!r}. Use .csv or .xlsx/.xls")
 
     if date_col is not None:
+        if date_col not in raw.columns:
+            raise ValueError(f"date_col {date_col!r} not found.")
         raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
         raw = raw.set_index(date_col)
     else:
@@ -174,7 +167,7 @@ def clean_market_data(
         restrict = [normalize_tenor_label(c) for c in restrict_tenors]
         missing = [c for c in restrict if c not in df.columns]
         if missing:
-            raise ValueError(f"Requested tenors not found: {missing}")
+            raise ValueError(f"Requested tenors not found in data: {missing}")
         df = df.loc[:, restrict].copy()
 
     for c in df.columns:
@@ -182,12 +175,12 @@ def clean_market_data(
 
     df = df.dropna(axis=1, how="all")
     if df.shape[1] == 0:
-        raise ValueError("No columns left after cleaning.")
+        raise ValueError("After cleaning, no columns left.")
 
     valid_frac = df.notna().mean(axis=1)
     df = df.loc[valid_frac >= min_valid_frac_per_row].copy()
     if df.shape[0] < 5:
-        raise ValueError("Too few rows after cleaning. Adjust thresholds.")
+        raise ValueError("Too few rows after cleaning; relax thresholds.")
 
     if max_gap_ffill and max_gap_ffill > 0:
         df = df.ffill(limit=max_gap_ffill)
@@ -216,17 +209,10 @@ def build_market_matrices(
     sort_columns_by_tenor: bool = True,
     compute_changes: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    """
-    Build (levels, changes, meta) either from:
-      - path to csv/xlsx, OR
-      - raw_df already loaded.
-
-    Changes are first differences of levels.
-    """
     if raw_df is None and path is None:
         raise ValueError("Provide either raw_df or path.")
-
     raw = raw_df if raw_df is not None else _read_table(path, sheet_name=sheet_name, date_col=date_col, index_col=index_col)
+
     cleaned = clean_market_data(
         raw,
         restrict_tenors=restrict_tenors,
@@ -238,7 +224,7 @@ def build_market_matrices(
     )
 
     levels = convert_levels(cleaned, units)
-    changes = levels.diff().iloc[1:].copy() if compute_changes else pd.DataFrame(index=levels.index, columns=levels.columns)
+    changes = levels.diff().iloc[1:].copy() if compute_changes else pd.DataFrame(index=levels.index, columns=levels.columns, dtype=float)
 
     meta = {
         "n_dates_levels": int(levels.shape[0]),
@@ -252,109 +238,191 @@ def build_market_matrices(
 
 
 # =============================================================================
-# Step 2 — PCA core
+# STEP 2 — Rolling PCA (THIS WAS THE MISSING CLASS)
 # =============================================================================
 
-def _sym_eigh_sorted(S: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    S = np.asarray(S, dtype=float)
-    eigvals, eigvecs = np.linalg.eigh(S)
-    idx = np.argsort(eigvals)[::-1]
-    eigvals, eigvecs = eigvals[idx], eigvecs[:, idx]
-    for j in range(eigvecs.shape[1]):
-        col = eigvecs[:, j]
-        k = int(np.argmax(np.abs(col)))
-        if col[k] < 0:
-            eigvecs[:, j] *= -1.0
-    return eigvals, eigvecs
-
-
-def _compute_cov_or_corr(
-    Xw: pd.DataFrame,
-    method: Literal["cov", "corr"],
-    estimator: Literal["sample", "ledoitwolf"],
-) -> Tuple[np.ndarray, pd.DataFrame]:
-    Xw = Xw.dropna(axis=0, how="any")
-    if Xw.shape[0] < 10:
-        raise ValueError("Too few observations after NaN drop.")
-    M = Xw.to_numpy(dtype=float)
-
-    if estimator == "ledoitwolf":
-        cov = LedoitWolf().fit(M).covariance_
-    elif estimator == "sample":
-        cov = np.cov(M, rowvar=False, ddof=1)
-    else:
-        raise ValueError(f"Unknown estimator: {estimator}")
-
-    cov = np.asarray(cov, dtype=float)
-
-    if method == "cov":
-        return cov, Xw
-
-    d = np.sqrt(np.clip(np.diag(cov), 1e-18, np.inf))
-    invd = 1.0 / d
-    corr = cov * invd[None, :] * invd[:, None]
-    corr = 0.5 * (corr + corr.T)
-    np.fill_diagonal(corr, 1.0)
-    return corr, Xw
-
-
 @dataclass
-class PCAState:
+class PCAFitResult:
     asof: pd.Timestamp
     window_start: pd.Timestamp
     window_end: pd.Timestamp
     n_obs: int
-    loadings: pd.DataFrame          # (N x k)
-    scores: pd.DataFrame            # (T x k)
-    explained_var_ratio: pd.Series  # length N (PC1..)
+    method: str
+    estimator: str
+    n_components: int
+    explained_var_ratio: pd.Series      # PC1..PCN
+    loadings: pd.DataFrame              # (tenors x k)
+    scores_in_window: pd.DataFrame      # (dates x k)
 
 
-def _fit_pca_on_window(
-    X_window: pd.DataFrame,
-    *,
-    asof: pd.Timestamp,
-    n_components: int,
-    method: Literal["cov", "corr"],
-    estimator: Literal["sample", "ledoitwolf"],
-) -> PCAState:
-    S, Xw = _compute_cov_or_corr(X_window, method=method, estimator=estimator)
-    eigvals, eigvecs = _sym_eigh_sorted(S)
-    total = float(np.sum(eigvals))
-    evr = eigvals / total if total > 0 else np.full_like(eigvals, np.nan)
+class RollingPCAModel:
+    """
+    Rolling PCA engine:
+      - cov/corr PCA with sample or LedoitWolf covariance
+      - symmetric eigendecomposition
+      - deterministic sign convention
+      - rolling window by row-count or by pandas offset ("2Y", "18M", ...)
+    """
+    def __init__(
+        self,
+        n_components: int = 3,
+        method: Literal["cov", "corr"] = "cov",
+        estimator: Literal["sample", "ledoitwolf"] = "ledoitwolf",
+        min_obs: int = 252,
+    ):
+        self.n_components = int(n_components)
+        self.method = method
+        self.estimator = estimator
+        self.min_obs = int(min_obs)
 
-    pcs = [f"PC{i+1}" for i in range(n_components)]
-    loadings = pd.DataFrame(eigvecs[:, :n_components], index=Xw.columns, columns=pcs)
-    scores = pd.DataFrame(Xw.to_numpy(dtype=float) @ loadings.to_numpy(dtype=float), index=Xw.index, columns=pcs)
+    @staticmethod
+    def _sym_eigh_sorted(S: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        S = np.asarray(S, dtype=float)
+        eigvals, eigvecs = np.linalg.eigh(S)
+        idx = np.argsort(eigvals)[::-1]
+        eigvals = eigvals[idx]
+        eigvecs = eigvecs[:, idx]
+        # deterministic sign
+        for j in range(eigvecs.shape[1]):
+            col = eigvecs[:, j]
+            k = int(np.argmax(np.abs(col)))
+            if col[k] < 0:
+                eigvecs[:, j] *= -1.0
+        return eigvals, eigvecs
 
-    evr_s = pd.Series(evr, index=[f"PC{i+1}" for i in range(len(evr))])
-    return PCAState(
-        asof=pd.Timestamp(asof),
-        window_start=pd.Timestamp(Xw.index.min()),
-        window_end=pd.Timestamp(Xw.index.max()),
-        n_obs=int(Xw.shape[0]),
-        loadings=loadings,
-        scores=scores,
-        explained_var_ratio=evr_s,
-    )
+    def _compute_cov_or_corr(self, Xw: pd.DataFrame) -> Tuple[np.ndarray, pd.DataFrame]:
+        Xw = Xw.dropna(axis=0, how="any")
+        if Xw.shape[0] < 10:
+            raise ValueError(f"Too few observations after NaN drop: {Xw.shape[0]}")
+        M = Xw.to_numpy(dtype=float)
 
+        if self.estimator == "ledoitwolf":
+            cov = LedoitWolf().fit(M).covariance_
+        elif self.estimator == "sample":
+            cov = np.cov(M, rowvar=False, ddof=1)
+        else:
+            raise ValueError(f"Unknown estimator: {self.estimator!r}")
 
-def _get_window(
-    X: pd.DataFrame,
-    asof_idx: int,
-    lookback: Union[int, str],
-) -> pd.DataFrame:
-    if isinstance(lookback, int):
-        start_i = max(0, asof_idx - lookback + 1)
-        return X.iloc[start_i:asof_idx + 1]
-    offset = pd.tseries.frequencies.to_offset(lookback)
-    asof = X.index[asof_idx]
-    start = asof - offset
-    return X.loc[(X.index > start) & (X.index <= asof)]
+        cov = np.asarray(cov, dtype=float)
+
+        if self.method == "cov":
+            return cov, Xw
+
+        if self.method == "corr":
+            d = np.sqrt(np.clip(np.diag(cov), 1e-18, np.inf))
+            invd = 1.0 / d
+            corr = cov * invd[None, :] * invd[:, None]
+            corr = 0.5 * (corr + corr.T)
+            np.fill_diagonal(corr, 1.0)
+            return corr, Xw
+
+        raise ValueError(f"Unknown method: {self.method!r}")
+
+    def fit_on_window(self, X_window: pd.DataFrame, asof: pd.Timestamp) -> PCAFitResult:
+        S, Xw = self._compute_cov_or_corr(X_window)
+        eigvals, eigvecs = self._sym_eigh_sorted(S)
+
+        total = float(np.sum(eigvals))
+        if total <= 0 or not np.isfinite(total):
+            raise ValueError("Invalid total variance from eigenvalues.")
+        evr = eigvals / total
+
+        k = self.n_components
+        pcs = [f"PC{i+1}" for i in range(k)]
+        loadings = pd.DataFrame(eigvecs[:, :k], index=Xw.columns, columns=pcs)
+        scores = pd.DataFrame(Xw.to_numpy(dtype=float) @ loadings.to_numpy(dtype=float), index=Xw.index, columns=pcs)
+
+        evr_s = pd.Series(evr, index=[f"PC{i+1}" for i in range(len(evr))])
+
+        return PCAFitResult(
+            asof=pd.Timestamp(asof),
+            window_start=pd.Timestamp(Xw.index.min()),
+            window_end=pd.Timestamp(Xw.index.max()),
+            n_obs=int(Xw.shape[0]),
+            method=self.method,
+            estimator=self.estimator,
+            n_components=k,
+            explained_var_ratio=evr_s,
+            loadings=loadings,
+            scores_in_window=scores,
+        )
+
+    def fit_rolling(
+        self,
+        X: pd.DataFrame,
+        lookback: Union[int, str] = "2Y",
+        step: int = 1,
+        verbose: bool = False,
+    ) -> Dict[pd.Timestamp, PCAFitResult]:
+        X = X.sort_index()
+        if not isinstance(X.index, pd.DatetimeIndex):
+            raise ValueError("X must have a DatetimeIndex.")
+        if X.shape[0] < self.min_obs:
+            raise ValueError(f"Not enough rows in X ({X.shape[0]}) for min_obs={self.min_obs}")
+
+        results: Dict[pd.Timestamp, PCAFitResult] = {}
+
+        if isinstance(lookback, int):
+            for i in range(self.min_obs, X.shape[0], step):
+                asof = X.index[i]
+                start_i = max(0, i - lookback + 1)
+                Xw = X.iloc[start_i:i + 1]
+                if Xw.dropna(axis=0, how="any").shape[0] < self.min_obs:
+                    continue
+                try:
+                    res = self.fit_on_window(Xw, asof=asof)
+                    results[asof] = res
+                    if verbose:
+                        ev3 = res.explained_var_ratio.iloc[:3].to_numpy()
+                        print(f"{asof.date()} EVR(1-3)={tuple(np.round(ev3,4))}")
+                except Exception as e:
+                    if verbose:
+                        print(f"[WARN] asof={asof.date()} failed: {e}")
+            return results
+
+        offset = pd.tseries.frequencies.to_offset(lookback)
+        for i in range(self.min_obs, X.shape[0], step):
+            asof = X.index[i]
+            start = asof - offset
+            Xw = X.loc[(X.index > start) & (X.index <= asof)]
+            if Xw.dropna(axis=0, how="any").shape[0] < self.min_obs:
+                continue
+            try:
+                res = self.fit_on_window(Xw, asof=asof)
+                results[asof] = res
+                if verbose:
+                    ev3 = res.explained_var_ratio.iloc[:3].to_numpy()
+                    print(f"{asof.date()} EVR(1-3)={tuple(np.round(ev3,4))}")
+            except Exception as e:
+                if verbose:
+                    print(f"[WARN] asof={asof.date()} failed: {e}")
+
+        return results
 
 
 # =============================================================================
-# Step 3A — Family A: implied PCA anchors
+# STEP 3A — Family A (Implied PCA): anchors
 # =============================================================================
+
+def _r2_like(y_true: np.ndarray, y_hat: np.ndarray) -> float:
+    num = float(np.linalg.norm(y_true - y_hat, ord="fro") ** 2)
+    den = float(np.linalg.norm(y_true, ord="fro") ** 2)
+    if den <= 1e-18:
+        return np.nan
+    return 1.0 - num / den
+
+
+def _rmse(a: np.ndarray, b: np.ndarray) -> float:
+    d = a - b
+    return float(np.sqrt(np.nanmean(d * d)))
+
+
+def _cond_number(A: np.ndarray) -> float:
+    try:
+        return float(np.linalg.cond(A))
+    except Exception:
+        return float("inf")
+
 
 @dataclass
 class AnchorSelectionConfig:
@@ -379,26 +447,6 @@ class FamilyAResult:
     cond: float
 
 
-def _r2_like(y_true: np.ndarray, y_hat: np.ndarray) -> float:
-    num = float(np.linalg.norm(y_true - y_hat, ord="fro") ** 2)
-    den = float(np.linalg.norm(y_true, ord="fro") ** 2)
-    if den <= 1e-18:
-        return np.nan
-    return 1.0 - num / den
-
-
-def _rmse(a: np.ndarray, b: np.ndarray) -> float:
-    d = a - b
-    return float(np.sqrt(np.nanmean(d * d)))
-
-
-def _cond(A: np.ndarray) -> float:
-    try:
-        return float(np.linalg.cond(A))
-    except Exception:
-        return float("inf")
-
-
 def _build_familyA_mapping(
     Xw: pd.DataFrame,
     L: pd.DataFrame,
@@ -412,8 +460,8 @@ def _build_familyA_mapping(
 
     XSm = XS.to_numpy(dtype=float)
     XtX = XSm.T @ XSm + ridge_lambda * np.eye(XSm.shape[1])
-    A = np.linalg.solve(XtX, XSm.T @ F)  # (|S| x k)
-    Bm = A @ L.to_numpy(dtype=float).T   # (|S| x N)
+    A = np.linalg.solve(XtX, XSm.T @ F)        # (|S| x k)
+    Bm = A @ L.to_numpy(dtype=float).T         # (|S| x N)
     B = pd.DataFrame(Bm, index=anchors, columns=tenors)
 
     Xhat = XSm @ Bm
@@ -421,7 +469,7 @@ def _build_familyA_mapping(
     rmse = _rmse(Xw2.to_numpy(dtype=float), Xhat)
 
     LS = L.loc[anchors, :].to_numpy(dtype=float)
-    cond = _cond(LS)
+    cond = _cond_number(LS)
     return B, score, rmse, cond
 
 
@@ -449,8 +497,8 @@ def _greedy_auto_anchors(
 
     for _ in range(cfg.k_anchors):
         best_pscore = -np.inf
-        best_c = None
         best_c_pack = None
+
         for c in candidates:
             if c in selected:
                 continue
@@ -464,11 +512,11 @@ def _greedy_auto_anchors(
             pscore = _penalized(score, cond, cfg.cond_penalty_lambda)
             if pscore > best_pscore:
                 best_pscore = pscore
-                best_c = c
                 best_c_pack = (trial, B, score, rmse, cond)
-        if best_c is None:
+
+        if best_c_pack is None:
             raise ValueError("Could not find feasible anchors under constraints.")
-        selected.append(best_c)
+        selected.append(best_c_pack[0][-1])
         best_pack = best_c_pack
 
     anchors, B, score, rmse, cond = best_pack  # type: ignore[misc]
@@ -476,7 +524,7 @@ def _greedy_auto_anchors(
 
 
 # =============================================================================
-# Step 3B — Family B: sparse proxy instruments
+# STEP 3B — Family B (Sparse proxies)
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -571,6 +619,8 @@ class FactorProxyFit:
 
 def _stability_select(Z: pd.DataFrame, y: pd.Series, cfg: StabilitySelectionConfig) -> Tuple[pd.Series, List[str]]:
     df = pd.concat([Z, y.rename("y")], axis=1).dropna(axis=0, how="any")
+    if df.shape[0] < 100:
+        raise ValueError(f"Too few rows for stability selection: {df.shape[0]}")
     Zm = df[Z.columns].to_numpy(dtype=float)
     ym = df["y"].to_numpy(dtype=float)
 
@@ -578,14 +628,16 @@ def _stability_select(Z: pd.DataFrame, y: pd.Series, cfg: StabilitySelectionConf
     n, m = Zm.shape
 
     if cfg.standardize_Z:
-        Zm = StandardScaler().fit_transform(Zm)
+        Zm = StandardScaler(with_mean=True, with_std=True).fit_transform(Zm)
     if cfg.standardize_y:
-        ym = StandardScaler().fit_transform(ym.reshape(-1, 1)).reshape(-1)
+        ym = StandardScaler(with_mean=True, with_std=True).fit_transform(ym.reshape(-1, 1)).reshape(-1)
 
     counts = np.zeros(m, dtype=int)
     n_sub = max(1, int(cfg.subsample_frac * n))
     idx_all = np.arange(n)
     alphas = list(cfg.alpha_grid)
+    if not alphas:
+        raise ValueError("alpha_grid must not be empty.")
 
     for b in range(cfg.n_subsamples):
         idx = rng.choice(idx_all, size=n_sub, replace=False)
@@ -620,7 +672,7 @@ def _refit_ridge(Z: pd.DataFrame, y: pd.Series, selected: List[str], ridge_alpha
 
 
 # =============================================================================
-# Step 4 — Backtest helpers
+# STEP 4 — Backtest / PnL tracking
 # =============================================================================
 
 def align_sensitivities(
@@ -632,7 +684,10 @@ def align_sensitivities(
     idx = X_changes.index
 
     if sens_by_tenor is not None:
-        S = sens_by_tenor.reindex(idx).ffill()
+        S = sens_by_tenor.copy()
+        if not isinstance(S.index, pd.DatetimeIndex):
+            raise ValueError("sens_by_tenor must have a DatetimeIndex.")
+        S = S.reindex(idx).ffill()
         missing = [c for c in tenors if c not in S.columns]
         if missing:
             raise ValueError(f"sens_by_tenor missing columns: {missing}")
@@ -668,10 +723,6 @@ def fit_hedge_weights(Z: pd.DataFrame, pnl: pd.Series, ridge_alpha: float) -> Tu
     return w, b
 
 
-def apply_weights(Z: pd.DataFrame, w: pd.Series, b: float) -> pd.Series:
-    return (b + (Z.reindex(columns=w.index) * w).sum(axis=1)).rename("pnl_hedge")
-
-
 def parse_instrument(name: str) -> Tuple[List[str], List[float]]:
     if name.startswith("OUT_"):
         t = name.replace("OUT_", "", 1)
@@ -688,10 +739,10 @@ def parse_instrument(name: str) -> Tuple[List[str], List[float]]:
 def build_selected_moves(X_changes: pd.DataFrame, selected: List[str]) -> pd.DataFrame:
     Z = pd.DataFrame(index=X_changes.index)
     for inst in selected:
-        legs, w = parse_instrument(inst)
+        legs, ww = parse_instrument(inst)
         vals = np.zeros(len(X_changes), dtype=float)
-        for leg, ww in zip(legs, w):
-            vals += ww * X_changes[leg].to_numpy(dtype=float)
+        for leg, w in zip(legs, ww):
+            vals += w * X_changes[leg].to_numpy(dtype=float)
         Z[inst] = vals
     return Z
 
@@ -719,13 +770,39 @@ def _summary(pnl_full: pd.Series, pnl_hedge: pd.Series) -> Dict[str, float]:
     }
 
 
+def make_synthetic_sensitivities(
+    X_changes: pd.DataFrame,
+    center_tenor: str = "10Y",
+    width: float = 2.0,
+    total_risk: float = 1e6,
+) -> pd.Series:
+    tenors = list(X_changes.columns)
+    years = []
+    for t in tenors:
+        try:
+            years.append(tenor_to_years(t))
+        except Exception:
+            years.append(np.nan)
+    years = np.array(years, dtype=float)
+
+    if center_tenor in tenors:
+        center_year = tenor_to_years(center_tenor)
+    else:
+        center_year = float(np.nanmedian(years[np.isfinite(years)]))
+
+    w = np.exp(-0.5 * ((years - center_year) / max(width, 1e-6)) ** 2)
+    w[~np.isfinite(w)] = 0.0
+    w = w / (np.sum(np.abs(w)) + 1e-18) * total_risk
+    return pd.Series(w, index=tenors, name="sens")
+
+
 # =============================================================================
 # ONE MAIN BUILDER FUNCTION
 # =============================================================================
 
 @dataclass
 class PCAHedgeOptions:
-    # Data options
+    # Data
     data_mode: Literal["path", "raw_df", "x_changes"] = "path"
     path: Optional[str] = None
     raw_df: Optional[pd.DataFrame] = None
@@ -742,7 +819,7 @@ class PCAHedgeOptions:
     normalize_columns: bool = True
     sort_columns_by_tenor: bool = True
 
-    # PCA options
+    # PCA
     n_components: int = 3
     pca_method: Literal["cov", "corr"] = "cov"
     pca_estimator: Literal["sample", "ledoitwolf"] = "ledoitwolf"
@@ -750,21 +827,17 @@ class PCAHedgeOptions:
     min_obs: int = 252
     step: int = 1
 
-    # Family selection
+    # Families
     run_familyA: bool = True
     run_familyB: bool = True
-
-    # Family A config
     familyA: AnchorSelectionConfig = AnchorSelectionConfig()
-
-    # Family B config
     familyB: StabilitySelectionConfig = StabilitySelectionConfig()
     familyB_max_spreads: Optional[int] = 3000
     familyB_max_flies: Optional[int] = 6000
     familyB_min_tenor_gap: int = 2
-    familyB_restrict_by_kind: bool = True
+    familyB_restrict_by_kind: bool = True  # PC1->outrights, PC2->spreads, PC3->flies
 
-    # Backtest options
+    # Backtest
     run_backtest: bool = False
     sens_by_tenor: Optional[pd.DataFrame] = None
     sens_vec: Optional[pd.Series] = None
@@ -774,19 +847,7 @@ class PCAHedgeOptions:
 
 
 def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
-    """
-    Main entry point.
-
-    Returns a dict with keys (depending on options):
-      - "levels", "changes", "meta"
-      - "pca_states" (rolling PCA results)
-      - "familyA" (dict asof -> FamilyAResult)
-      - "familyB" (dict asof -> dict pc -> FactorProxyFit)
-      - "backtestA", "backtestB" + "statsA", "statsB"  (if run_backtest)
-    """
-    # -----------------------------
     # 1) Build X_changes
-    # -----------------------------
     levels = None
     meta: Dict[str, Any] = {}
 
@@ -821,9 +882,7 @@ def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
     if X_changes.shape[0] < opts.min_obs:
         raise ValueError(f"Not enough rows in X_changes ({X_changes.shape[0]}) for min_obs={opts.min_obs}")
 
-    # -----------------------------
-    # 2) Rolling PCA states (Step 2)
-    # -----------------------------
+    # 2) Rolling PCA
     pca_engine = RollingPCAModel(
         n_components=opts.n_components,
         method=opts.pca_method,
@@ -832,20 +891,20 @@ def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
     )
     pca_states = pca_engine.fit_rolling(X_changes, lookback=opts.lookback, step=opts.step, verbose=False)
 
-    if opts.verbose:
-        last = next(reversed(pca_states.keys()))
-        ev3 = pca_states[last].explained_var_ratio.iloc[:3].to_numpy()
-        print(f"[PCA] last asof={last.date()} EVR(1-3)={tuple(np.round(ev3,4))}")
+    if opts.verbose and pca_states:
+        last_asof = list(pca_states.keys())[-1]
+        ev3 = pca_states[last_asof].explained_var_ratio.iloc[:3].to_numpy()
+        print(f"[PCA] last asof={last_asof.date()} EVR(1-3)={tuple(np.round(ev3,4))}")
 
-    # -----------------------------
-    # 3) Family A + Family B per asof (Step 3)
-    # -----------------------------
-    familyA_out: Dict[pd.Timestamp, FamilyAResult] = {}
-    familyB_out: Dict[pd.Timestamp, Dict[str, FactorProxyFit]] = {}
+    out: Dict[str, Any] = {
+        "levels": levels,
+        "changes": X_changes,
+        "meta": meta,
+        "pca_states": pca_states,
+    }
 
+    # Prebuild Family B instrument library
     tenors = list(X_changes.columns)
-
-    # prebuild B library (names fixed)
     lib_full = build_instrument_library(
         tenors=tenors,
         include_outrights=True,
@@ -859,38 +918,54 @@ def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
     lib_spr = [i for i in lib_full if i.kind == "spread"]
     lib_fly = [i for i in lib_full if i.kind == "fly"]
 
+    # 3) Family A + B (per asof)
+    familyA_out: Dict[pd.Timestamp, FamilyAResult] = {}
+    familyB_out: Dict[pd.Timestamp, Dict[str, FactorProxyFit]] = {}
+
     prevA: Optional[FamilyAResult] = None
 
     for asof, state in pca_states.items():
-        # calibration window used for this asof:
-        # NOTE: we recompute the same window slice for hedging/selection consistency.
-        asof_idx = X_changes.index.get_loc(asof)
-        Xw = _get_window(X_changes, asof_idx, opts.lookback).dropna(axis=0, how="any")
+        # Recreate the same window slice used for that asof (for selection/backtest consistency)
+        i = X_changes.index.get_loc(asof)
+        if isinstance(opts.lookback, int):
+            start_i = max(0, i - opts.lookback + 1)
+            Xw = X_changes.iloc[start_i:i + 1]
+        else:
+            offset = pd.tseries.frequencies.to_offset(opts.lookback)
+            start = asof - offset
+            Xw = X_changes.loc[(X_changes.index > start) & (X_changes.index <= asof)]
+        Xw = Xw.dropna(axis=0, how="any")
         if Xw.shape[0] < opts.min_obs:
             continue
 
         L = state.loadings
-        # ---------------- Family A
+        F = state.scores_in_window
+
+        # --- Family A
         if opts.run_familyA:
             cfgA = opts.familyA
+
             if cfgA.anchors_mode == "fixed":
                 if not cfgA.fixed_anchors:
                     raise ValueError("FamilyA fixed mode requires fixed_anchors.")
                 anchors = [normalize_tenor_label(a) for a in cfgA.fixed_anchors]
+                missing = [a for a in anchors if a not in X_changes.columns]
+                if missing:
+                    raise ValueError(f"Fixed anchors not in curve columns: {missing}")
                 B, score, rmse, cond = _build_familyA_mapping(Xw, L, anchors, cfgA.ridge_lambda)
                 newA = FamilyAResult(asof=asof, anchors=anchors, mapping_B=B, score=score, rmse=rmse, cond=cond)
             else:
                 autoA = _greedy_auto_anchors(Xw, L, cfgA)
                 newA = FamilyAResult(asof=asof, anchors=autoA.anchors, mapping_B=autoA.mapping_B, score=autoA.score, rmse=autoA.rmse, cond=autoA.cond)
 
-            # stickiness
             if prevA is None:
                 chosenA = newA
                 switched = True
             else:
                 improvement = newA.score - prevA.score
                 if improvement < cfgA.min_improvement_to_switch:
-                    chosenA = FamilyAResult(asof=asof, anchors=prevA.anchors, mapping_B=prevA.mapping_B, score=prevA.score, rmse=prevA.rmse, cond=prevA.cond)
+                    chosenA = FamilyAResult(asof=asof, anchors=prevA.anchors, mapping_B=prevA.mapping_B,
+                                           score=prevA.score, rmse=prevA.rmse, cond=prevA.cond)
                     switched = False
                 else:
                     chosenA = newA
@@ -903,14 +978,12 @@ def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
                 tag = "SWITCH" if switched else "KEEP"
                 print(f"[A] {asof.date()} {tag} anchors={chosenA.anchors} score={chosenA.score:.5f} cond={chosenA.cond:.1f}")
 
-        # ---------------- Family B
+        # --- Family B
         if opts.run_familyB:
             cfgB = opts.familyB
 
-            # y targets are PCA scores in the same window index
-            # (state.scores are already computed on cleaned window inside PCA)
-            F = state.scores
-            XwB = Xw.loc[F.index]  # align
+            # Ensure alignment between Xw and PCA scores (scores were computed on the window after dropna)
+            XwB = Xw.loc[F.index]
 
             day_res: Dict[str, FactorProxyFit] = {}
             for pc in F.columns:
@@ -946,25 +1019,16 @@ def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
                 s3 = day_res.get("PC3").selected if "PC3" in day_res else []
                 print(f"[B] {asof.date()} PC1={s1} PC2={s2} PC3={s3}")
 
-    out: Dict[str, Any] = {
-        "levels": levels,
-        "changes": X_changes,
-        "meta": meta,
-        "pca_states": pca_states,
-    }
     if opts.run_familyA:
         out["familyA"] = familyA_out
     if opts.run_familyB:
         out["familyB"] = familyB_out
 
-    # -----------------------------
-    # 4) Optional backtest
-    # -----------------------------
+    # 4) Backtest
     if opts.run_backtest:
         sens = align_sensitivities(X_changes, sens_by_tenor=opts.sens_by_tenor, sens_vec=opts.sens_vec)
         pnl_full = compute_full_pnl(X_changes, sens)
-
-        bt_cfg = opts.backtest
+        bt = opts.backtest
 
         if opts.run_familyA:
             pnl_A = pd.Series(index=X_changes.index, dtype=float, name="pnl_A")
@@ -974,23 +1038,26 @@ def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
                 i = X_changes.index.get_loc(asof)
                 if i >= len(X_changes.index) - 1:
                     continue
-                Xw = _get_window(X_changes, i, bt_cfg.lookback).dropna(axis=0, how="any")
-                if Xw.shape[0] < bt_cfg.min_obs:
+                # window
+                if isinstance(bt.lookback, int):
+                    start_i = max(0, i - bt.lookback + 1)
+                    Xw = X_changes.iloc[start_i:i + 1]
+                else:
+                    offset = pd.tseries.frequencies.to_offset(bt.lookback)
+                    start = asof - offset
+                    Xw = X_changes.loc[(X_changes.index > start) & (X_changes.index <= asof)]
+                Xw = Xw.dropna(axis=0, how="any")
+                if Xw.shape[0] < bt.min_obs:
                     continue
 
-                anchors = Ares.anchors
-                Z_w = Xw.loc[:, anchors]
-                w, b = fit_hedge_weights(Z_w, pnl_full.loc[Xw.index], bt_cfg.ridge_alpha)
+                Z_w = Xw.loc[:, Ares.anchors]
+                w, b = fit_hedge_weights(Z_w, pnl_full.loc[Xw.index], bt.ridge_alpha)
 
                 t_next = X_changes.index[i + 1]
-                Z_next = X_changes.loc[[t_next], anchors]
+                Z_next = X_changes.loc[[t_next], Ares.anchors]
                 pnl_A.loc[t_next] = float(b + (Z_next.iloc[0] * w).sum())
 
-            out["backtestA"] = {
-                "pnl_full": pnl_full,
-                "pnl_A": pnl_A,
-                "resid_A": pnl_full - pnl_A,
-            }
+            out["backtestA"] = {"pnl_full": pnl_full, "pnl_A": pnl_A, "resid_A": pnl_full - pnl_A}
             out["statsA"] = _summary(pnl_full, pnl_A)
 
         if opts.run_familyB:
@@ -1001,9 +1068,16 @@ def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
                 i = X_changes.index.get_loc(asof)
                 if i >= len(X_changes.index) - 1:
                     continue
-
-                Xw = _get_window(X_changes, i, bt_cfg.lookback).dropna(axis=0, how="any")
-                if Xw.shape[0] < bt_cfg.min_obs:
+                # window
+                if isinstance(bt.lookback, int):
+                    start_i = max(0, i - bt.lookback + 1)
+                    Xw = X_changes.iloc[start_i:i + 1]
+                else:
+                    offset = pd.tseries.frequencies.to_offset(bt.lookback)
+                    start = asof - offset
+                    Xw = X_changes.loc[(X_changes.index > start) & (X_changes.index <= asof)]
+                Xw = Xw.dropna(axis=0, how="any")
+                if Xw.shape[0] < bt.min_obs:
                     continue
 
                 selected = sorted(set(inst for fit in Bres.values() for inst in fit.selected))
@@ -1011,30 +1085,26 @@ def build_pca_hedge_model(opts: PCAHedgeOptions) -> Dict[str, Any]:
                     continue
 
                 Z_w = build_selected_moves(Xw, selected)
-                w, b = fit_hedge_weights(Z_w, pnl_full.loc[Xw.index], bt_cfg.ridge_alpha)
+                w, b = fit_hedge_weights(Z_w, pnl_full.loc[Xw.index], bt.ridge_alpha)
 
                 t_next = X_changes.index[i + 1]
                 Z_next = build_selected_moves(X_changes.loc[[t_next]], selected)
                 pnl_B.loc[t_next] = float(b + (Z_next.iloc[0] * w).sum())
 
-            out["backtestB"] = {
-                "pnl_full": pnl_full,
-                "pnl_B": pnl_B,
-                "resid_B": pnl_full - pnl_B,
-            }
+            out["backtestB"] = {"pnl_full": pnl_full, "pnl_B": pnl_B, "resid_B": pnl_full - pnl_B}
             out["statsB"] = _summary(pnl_full, pnl_B)
 
     return out
 
 
 # =============================================================================
-# Minimal example (edit paths to run)
+# Example
 # =============================================================================
 if __name__ == "__main__":
-    # Example: only build PCA + Family A with fixed anchors, no backtest
+    # Example usage (edit your paths):
     opts = PCAHedgeOptions(
         data_mode="path",
-        path="curve_timeseries.csv",  # <-- set your file path
+        path="curve_timeseries.csv",
         units=RateUnits("pct", "bp"),
         n_components=3,
         pca_method="cov",
@@ -1042,7 +1112,7 @@ if __name__ == "__main__":
         lookback="2Y",
         min_obs=252,
         run_familyA=True,
-        run_familyB=False,
+        run_familyB=True,
         familyA=AnchorSelectionConfig(
             anchors_mode="fixed",
             fixed_anchors=["3Y", "5Y", "10Y", "20Y"],
@@ -1056,5 +1126,5 @@ if __name__ == "__main__":
     )
 
     # model = build_pca_hedge_model(opts)
-    # print("Keys:", model.keys())
-    print("Unified builder ready. Uncomment model = build_pca_hedge_model(opts) and set paths.")
+    # print(model.keys())
+    print("Corrected full code loaded (includes RollingPCAModel). Set paths and uncomment the call.")
